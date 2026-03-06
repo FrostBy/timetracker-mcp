@@ -4,8 +4,12 @@
   "description": "MCP server for time tracking per ticket with idle detection",
   "type": "module",
   "main": "dist/index.js",
+  "bin": {
+    "timetracker-mcp": "dist/index.js"
+  },
   "scripts": {
     "build": "tsc",
+    "prepare": "npm run build",
     "start": "node dist/index.js"
   },
   "dependencies": {
