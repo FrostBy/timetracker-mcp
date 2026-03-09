@@ -65,7 +65,7 @@ function applyIdleCheck(data: ReturnType<typeof loadData>, root: string): string
 
 const server = new McpServer({
   name: 'timetracker',
-  version: '1.0.0',
+  version: '2026.3.10-1',
 });
 
 // tracker_start
