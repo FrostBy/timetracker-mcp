@@ -1,0 +1,7 @@
+{
+  "name": "timetracker",
+  "version": "1.0.0",
+  "description": "Time tracking for AI-assisted work sessions with idle detection",
+  "hooks": "./hooks/hooks.json",
+  "mcpServers": "./.mcp.json"
+}

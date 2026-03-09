@@ -17,14 +17,17 @@ export function findActiveEntry(data: TrackData): TimeEntry | undefined {
 }
 
 export function findEntry(data: TrackData, ticketId: string): TimeEntry | undefined {
-  return data.entries.find((e) => e.ticketId === ticketId);
+  return data.entries.find((e) => e.ticketId === ticketId && e.status !== 'completed')
+    ?? [...data.entries].reverse().find((e) => e.ticketId === ticketId);
 }
 
-export function checkIdle(entry: TimeEntry): string | null {
+export function checkIdle(entry: TimeEntry, pingActivity?: string | null): string | null {
   if (entry.status !== 'active') return null;
 
   const now = Date.now();
-  const lastActivity = new Date(entry.lastActivityAt).getTime();
+  const entryActivity = new Date(entry.lastActivityAt).getTime();
+  const pingActivityMs = pingActivity ? new Date(pingActivity).getTime() : 0;
+  const lastActivity = Math.max(entryActivity, pingActivityMs);
   const thresholdMs = entry.idleThresholdMinutes * 60 * 1000;
 
   if (now - lastActivity > thresholdMs) {
@@ -37,6 +40,14 @@ export function checkIdle(entry: TimeEntry): string | null {
   return null;
 }
 
+export function closeLastPause(entry: TimeEntry, timestamp?: string): void {
+  if (entry.pauses.length === 0) return;
+  const lastPause = entry.pauses[entry.pauses.length - 1];
+  if (lastPause && !lastPause.end) {
+    lastPause.end = timestamp ?? new Date().toISOString();
+  }
+}
+
 export function touchActivity(entry: TimeEntry): void {
   entry.lastActivityAt = new Date().toISOString();
 }
@@ -45,22 +56,31 @@ export function startEntry(
   data: TrackData,
   ticketId: string,
   idleThresholdMinutes?: number,
-): { entry: TimeEntry; stoppedPrevious?: string } {
+): { entry: TimeEntry; pausedPrevious?: string; resumed?: boolean } {
   const existing = findEntry(data, ticketId);
-  if (existing && (existing.status === 'active' || existing.status === 'paused')) {
-    throw new Error(`Already tracking ${ticketId}`);
+
+  // Idempotent: already active — just return
+  if (existing?.status === 'active') {
+    touchActivity(existing);
+    return { entry: existing };
   }
 
-  let stoppedPrevious: string | undefined;
+  // Was paused — resume instead of creating new
+  if (existing?.status === 'paused') {
+    closeLastPause(existing);
+    existing.status = 'active';
+    existing.lastActivityAt = new Date().toISOString();
+    return { entry: existing, resumed: true };
+  }
+
+  // Auto-pause previous active entry (not stop)
+  let pausedPrevious: string | undefined;
   const active = findActiveEntry(data);
   if (active) {
-    active.stoppedAt = new Date().toISOString();
-    active.status = 'completed';
-    if (active.pauses.length > 0) {
-      const lastPause = active.pauses[active.pauses.length - 1];
-      if (!lastPause.end) lastPause.end = active.stoppedAt;
-    }
-    stoppedPrevious = active.ticketId;
+    active.pauses.push({ start: new Date().toISOString() });
+    active.status = 'paused';
+    active.lastActivityAt = new Date().toISOString();
+    pausedPrevious = active.ticketId;
   }
 
   const now = new Date().toISOString();
@@ -74,7 +94,7 @@ export function startEntry(
     lastActivityAt: now,
   };
   data.entries.push(entry);
-  return { entry, stoppedPrevious };
+  return { entry, pausedPrevious };
 }
 
 export function stopEntry(data: TrackData, ticketId?: string): TimeEntry {
@@ -94,11 +114,7 @@ export function stopEntry(data: TrackData, ticketId?: string): TimeEntry {
   const now = new Date().toISOString();
   entry.stoppedAt = now;
   entry.status = 'completed';
-
-  if (entry.pauses.length > 0) {
-    const lastPause = entry.pauses[entry.pauses.length - 1];
-    if (!lastPause.end) lastPause.end = now;
-  }
+  closeLastPause(entry, now);
 
   return entry;
 }
@@ -131,11 +147,7 @@ export function resumeEntry(data: TrackData, ticketId?: string): TimeEntry {
   if (!entry) throw new Error(ticketId ? `No entry found for ${ticketId}` : 'No paused entry to resume');
   if (entry.status !== 'paused') throw new Error(`${entry.ticketId} is not paused (status: ${entry.status})`);
 
-  const lastPause = entry.pauses[entry.pauses.length - 1];
-  if (lastPause && !lastPause.end) {
-    lastPause.end = new Date().toISOString();
-  }
-
+  closeLastPause(entry);
   entry.status = 'active';
   entry.lastActivityAt = new Date().toISOString();
   return entry;

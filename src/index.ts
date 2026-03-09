@@ -2,7 +2,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { loadData, saveData } from './storage.js';
+import { loadData, saveData, readActivityPing } from './storage.js';
 import {
   startEntry,
   stopEntry,
@@ -12,6 +12,7 @@ import {
   findActiveEntry,
   findEntry,
   checkIdle,
+  closeLastPause,
   touchActivity,
   formatEntry,
   calculateNetTime,
@@ -44,12 +45,20 @@ async function getProjectRoot(server: McpServer): Promise<string> {
   throw new Error('Cannot determine project root. Set PROJECT_DIR env or ensure client supports MCP roots.');
 }
 
-function withIdleCheck(data: ReturnType<typeof loadData>): string[] {
+function applyIdleCheck(data: ReturnType<typeof loadData>, root: string): string[] {
   const warnings: string[] = [];
   const active = findActiveEntry(data);
   if (active) {
-    const idleWarning = checkIdle(active);
-    if (idleWarning) warnings.push(idleWarning);
+    const pingActivity = readActivityPing(root);
+    const idleWarning = checkIdle(active, pingActivity);
+    if (idleWarning) {
+      warnings.push(idleWarning);
+      // Auto-resume: close idle pause and reactivate
+      closeLastPause(active);
+      active.status = 'active';
+      active.lastActivityAt = new Date().toISOString();
+      warnings.push(`Auto-resumed: ${active.ticketId}`);
+    }
   }
   return warnings;
 }
@@ -62,27 +71,31 @@ const server = new McpServer({
 // tracker_start
 server.tool(
   'tracker_start',
-  'Start tracking time for a ticket. Auto-stops any currently active ticket.',
+  'Start tracking time for a ticket. Auto-pauses any currently active ticket.',
   {
     ticketId: z.string().describe('Ticket ID (e.g. ENGP-3571)'),
-    idleThresholdMinutes: z.number().optional().describe('Idle threshold in minutes (default from env or 60)'),
+    idleThresholdMinutes: z.number().positive().optional().describe('Idle threshold in minutes (default from env or 60)'),
   },
   async (params) => {
     const root = await getProjectRoot(server);
     const data = loadData(root);
 
     try {
-      const { entry, stoppedPrevious } = startEntry(data, params.ticketId, params.idleThresholdMinutes);
+      const { entry, pausedPrevious, resumed } = startEntry(data, params.ticketId, params.idleThresholdMinutes);
       saveData(root, data);
 
       const lines: string[] = [];
-      if (stoppedPrevious) lines.push(`Auto-stopped: ${stoppedPrevious}`);
-      lines.push(`Started tracking: ${entry.ticketId}`);
+      if (pausedPrevious) lines.push(`Auto-paused: ${pausedPrevious}`);
+      if (resumed) {
+        lines.push(`Resumed tracking: ${entry.ticketId}`);
+      } else {
+        lines.push(`Started tracking: ${entry.ticketId}`);
+      }
       lines.push(`Idle threshold: ${entry.idleThresholdMinutes}m`);
 
       return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
     } catch (e) {
-      return { content: [{ type: 'text' as const, text: `Error: ${(e as Error).message}` }], isError: true };
+      return { content: [{ type: 'text' as const, text: `Error: ${(e as Error)?.message ?? e}` }], isError: true };
     }
   },
 );
@@ -97,7 +110,7 @@ server.tool(
   async (params) => {
     const root = await getProjectRoot(server);
     const data = loadData(root);
-    const warnings = withIdleCheck(data);
+    const warnings = applyIdleCheck(data, root);
 
     try {
       const entry = stopEntry(data, params.ticketId);
@@ -106,7 +119,7 @@ server.tool(
       const lines = [...warnings, formatEntry(entry)];
       return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
     } catch (e) {
-      return { content: [{ type: 'text' as const, text: `Error: ${(e as Error).message}` }], isError: true };
+      return { content: [{ type: 'text' as const, text: `Error: ${(e as Error)?.message ?? e}` }], isError: true };
     }
   },
 );
@@ -127,7 +140,7 @@ server.tool(
       saveData(root, data);
       return { content: [{ type: 'text' as const, text: `Paused: ${entry.ticketId}` }] };
     } catch (e) {
-      return { content: [{ type: 'text' as const, text: `Error: ${(e as Error).message}` }], isError: true };
+      return { content: [{ type: 'text' as const, text: `Error: ${(e as Error)?.message ?? e}` }], isError: true };
     }
   },
 );
@@ -145,11 +158,10 @@ server.tool(
 
     try {
       const entry = resumeEntry(data, params.ticketId);
-      touchActivity(entry);
       saveData(root, data);
       return { content: [{ type: 'text' as const, text: `Resumed: ${entry.ticketId}` }] };
     } catch (e) {
-      return { content: [{ type: 'text' as const, text: `Error: ${(e as Error).message}` }], isError: true };
+      return { content: [{ type: 'text' as const, text: `Error: ${(e as Error)?.message ?? e}` }], isError: true };
     }
   },
 );
@@ -160,7 +172,7 @@ server.tool(
   'Adjust tracked time for a ticket (+/- minutes).',
   {
     ticketId: z.string().describe('Ticket ID'),
-    minutes: z.number().describe('Minutes to adjust (positive to add, negative to subtract)'),
+    minutes: z.number().int().describe('Minutes to adjust (positive to add, negative to subtract)'),
     reason: z.string().optional().describe('Reason for adjustment'),
   },
   async (params) => {
@@ -177,7 +189,7 @@ server.tool(
         content: [{ type: 'text' as const, text: `Adjusted ${entry.ticketId}: ${sign}${params.minutes}m${reasonText}` }],
       };
     } catch (e) {
-      return { content: [{ type: 'text' as const, text: `Error: ${(e as Error).message}` }], isError: true };
+      return { content: [{ type: 'text' as const, text: `Error: ${(e as Error)?.message ?? e}` }], isError: true };
     }
   },
 );
@@ -192,7 +204,7 @@ server.tool(
   async (params) => {
     const root = await getProjectRoot(server);
     const data = loadData(root);
-    const warnings = withIdleCheck(data);
+    const warnings = applyIdleCheck(data, root);
 
     const entry = findEntry(data, params.ticketId);
     if (!entry) {
@@ -215,7 +227,7 @@ server.tool(
   async () => {
     const root = await getProjectRoot(server);
     const data = loadData(root);
-    const warnings = withIdleCheck(data);
+    const warnings = applyIdleCheck(data, root);
 
     const active = findActiveEntry(data);
     if (!active) {
@@ -226,6 +238,104 @@ server.tool(
     saveData(root, data);
 
     const lines = [...warnings, formatEntry(active)];
+    return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
+  },
+);
+
+// tracker_ping
+server.tool(
+  'tracker_ping',
+  'Lightweight activity ping. Updates lastActivityAt for idle detection. Use from hooks.',
+  {},
+  async () => {
+    const root = await getProjectRoot(server);
+    const data = loadData(root);
+    const warnings = applyIdleCheck(data, root);
+
+    const active = findActiveEntry(data);
+    if (active) {
+      touchActivity(active);
+      saveData(root, data);
+      return { content: [{ type: 'text' as const, text: [...warnings, `Ping: ${active.ticketId}`].join('\n') }] };
+    }
+
+    return { content: [{ type: 'text' as const, text: 'No active entry.' }] };
+  },
+);
+
+// tracker_list
+server.tool(
+  'tracker_list',
+  'List all tracked entries with optional filters.',
+  {
+    status: z.enum(['active', 'paused', 'completed']).optional().describe('Filter by status'),
+    days: z.number().positive().optional().describe('Show entries from last N days (default 7)'),
+  },
+  async (params) => {
+    const root = await getProjectRoot(server);
+    const data = loadData(root);
+    applyIdleCheck(data, root);
+    saveData(root, data);
+
+    const cutoff = Date.now() - (params.days ?? 7) * 24 * 60 * 60 * 1000;
+    const filtered = data.entries.filter((e) => {
+      if (params.status && e.status !== params.status) return false;
+      return new Date(e.startedAt).getTime() > cutoff;
+    });
+
+    if (filtered.length === 0) {
+      return { content: [{ type: 'text' as const, text: 'No entries found.' }] };
+    }
+
+    const lines = filtered.map((e) => {
+      const time = calculateNetTime(e);
+      return `${e.ticketId} [${e.status}] ${time.formatted}`;
+    });
+
+    return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
+  },
+);
+
+// tracker_report
+server.tool(
+  'tracker_report',
+  'Aggregated time report by ticket for a period.',
+  {
+    days: z.number().positive().optional().describe('Report period in days (default 7)'),
+  },
+  async (params) => {
+    const root = await getProjectRoot(server);
+    const data = loadData(root);
+    applyIdleCheck(data, root);
+    saveData(root, data);
+
+    const cutoff = Date.now() - (params.days ?? 7) * 24 * 60 * 60 * 1000;
+    const relevant = data.entries.filter((e) => new Date(e.startedAt).getTime() > cutoff);
+
+    if (relevant.length === 0) {
+      return { content: [{ type: 'text' as const, text: 'No entries in this period.' }] };
+    }
+
+    const byTicket = new Map<string, number>();
+    for (const e of relevant) {
+      const { netMs } = calculateNetTime(e);
+      byTicket.set(e.ticketId, (byTicket.get(e.ticketId) ?? 0) + netMs);
+    }
+
+    let totalMs = 0;
+    const lines: string[] = [];
+    for (const [ticketId, ms] of byTicket) {
+      totalMs += ms;
+      const h = Math.floor(ms / 3600000);
+      const m = Math.round((ms % 3600000) / 60000);
+      lines.push(`${ticketId}: ${h}h ${m}m`);
+    }
+
+    const totalH = Math.floor(totalMs / 3600000);
+    const totalM = Math.round((totalMs % 3600000) / 60000);
+    lines.push(`---`);
+    lines.push(`Total: ${totalH}h ${totalM}m`);
+
     return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
   },
 );
